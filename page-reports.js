@@ -30,28 +30,28 @@ async function addLocationToSheet(type, value, governorate = '', region = '') {
     if (!cleanValue) throw new Error('يرجى إدخال القيمة الجديدة.');
     if (!navigator.onLine) throw new Error('إضافة بيانات جديدة تحتاج إلى اتصال بالإنترنت.');
 
-    const payload = {
-        action: 'addLocation',
-        payload: {
-            type,
-            value: cleanValue,
-            governorate: String(governorate ?? '').trim(),
-            region: String(region ?? '').trim()
-        }
-    };
-
-    const response = await fetch(SCRIPT_URL, {
-        method: 'POST',
-        headers: { 'Content-Type': 'text/plain;charset=utf-8' },
-        body: JSON.stringify(payload),
-        cache: 'no-store'
+    const result = await apiPost('addLocation', {
+        type,
+        value: cleanValue,
+        governorate: String(governorate ?? '').trim(),
+        region: String(region ?? '').trim()
     });
-    if (!response.ok) throw new Error(`HTTP ${response.status}`);
-    const result = await response.json();
     if (!result || result.status !== 'success') {
         throw new Error(result?.message || 'تعذر إضافة البيانات إلى Locations');
     }
     return result;
+}
+
+// Price-source rule for report sales: direct-promotion-and-sale events always
+// use the shared Products price; all other event types use this account's
+// personal price, falling back to Products only until a personal price exists.
+function resolveReportSalePrice(eventValue, productPrice, personalPrice) {
+    const masterCandidate = Number(productPrice);
+    const masterPrice = Number.isFinite(masterCandidate) && masterCandidate >= 0 ? masterCandidate : 0;
+    if (String(eventValue ?? '').trim() === 'ترويج وبيع مباشر') return masterPrice;
+    if (personalPrice === undefined || personalPrice === null || personalPrice === '') return masterPrice;
+    const personalCandidate = Number(personalPrice);
+    return Number.isFinite(personalCandidate) && personalCandidate >= 0 ? personalCandidate : masterPrice;
 }
 
 function setupLocationAddButtons(DBRef) {
@@ -138,16 +138,66 @@ function setupLocationAddButtons(DBRef) {
 // ===================================================================
 async function handleReportPage() {
     let isFormDirty = false;
-    
+    let stateRestoring = false;
+    let isFormInitializing = true;
+    let resetAfterSubmitSuccess = false;
+
+    // أسعار المستخدم محفوظة منفصلة عن Products المشتركة. نقرأ كاش صاحب الحساب
+    // فوراً ثم نحدّثه من الخادم بالتوازي مع تحميل بيانات الصفحة الأساسية.
+    const userProductPriceCacheKey = () => ownerScopedKey('userProductPrices');
+    const userProductPriceScopeKey = (campaign, product) =>
+        `${String(campaign ?? '').trim().toLocaleLowerCase()}\u0000${String(product ?? '').trim().toLocaleLowerCase()}`;
+    let userProductPricesByKey = new Map();
+    const replaceUserProductPrices = (entries) => {
+        const next = new Map();
+        (Array.isArray(entries) ? entries : []).forEach(entry => {
+            const campaign = String(entry?.campaign ?? '').trim();
+            const product = String(entry?.product ?? '').trim();
+            const price = Number(entry?.price);
+            if (!campaign || !product || !Number.isFinite(price) || price < 0) return;
+            next.set(userProductPriceScopeKey(campaign, product), { campaign, product, barcode: String(entry?.barcode ?? '').trim(), price });
+        });
+        userProductPricesByKey = next;
+    };
+    const saveUserProductPricesCache = () => {
+        try { localStorage.setItem(userProductPriceCacheKey(), JSON.stringify(Array.from(userProductPricesByKey.values()))); }
+        catch (e) { console.warn('تعذر حفظ كاش أسعار المستخدم محلياً:', e); }
+    };
+    try {
+        const cachedUserPrices = JSON.parse(localStorage.getItem(userProductPriceCacheKey()) || '[]');
+        replaceUserProductPrices(cachedUserPrices);
+    } catch (e) {}
+    const userProductPricesRequest = navigator.onLine
+        ? apiGet('getUserProductPrices', { v: 'user-prices-v1' }).catch(error => {
+            console.warn('تعذر تحميل الأسعار الشخصية من الخادم؛ سيُستخدم الكاش إن وجد:', error);
+            return null;
+        })
+        : Promise.resolve(null);
+
     const mainContainer = document.querySelector('.main-container');
     const form = document.getElementById('reportForm');
     form.style.display = 'none';
     mainContainer.insertAdjacentHTML('afterbegin', `<div id="loading-spinner" class="text-center p-5"><div class="mx-auto mb-3" style="width:80%;"><div class="skeleton skeleton-line"></div><div class="skeleton skeleton-line skeleton-line-medium"></div><div class="skeleton skeleton-line"></div><div class="skeleton skeleton-line skeleton-line-short"></div><div class="skeleton skeleton-card"></div></div></div>`);
     let DB = await getDbData();
     if (!DB) {
-        const logoutOnClick = "localStorage.clear(); sessionStorage.clear(); window.location.href='index.html'; return false;";
+        const logoutOnClick = "localStorage.clear(); sessionStorage.clear(); if (typeof navigateTo === 'function') { navigateTo('login'); } else { window.location.href = 'index.html'; } return false;";
         mainContainer.innerHTML = `<div class="alert alert-danger">فشل تحميل البيانات الأساسية. يرجى <a href="#" onclick="${logoutOnClick}">تسجيل الخروج</a> والمحاولة مرة أخرى.</div>`;
         return;
+    }
+    // لا ننتظر الشبكة هنا: تُعرض الصفحة مباشرةً من كاش المتصفح/Products،
+    // ثم تُطبّق الأسعار الشخصية في الخلفية فور وصولها.
+    // إصلاح ذاتي: كاش قديم من نسخة ما قبل دمج الموظفين → نجلب البيانات في الخلفية
+    // حتى تظهر أسماء "الأشخاص المتواجدين ضمن النقطة" دون انتظار الشاشة.
+    if (!Array.isArray(DB.employees) && navigator.onLine) {
+        try {
+            apiGet('getInitialData', { forceRefresh: 1, v: APP_DB_VERSION }).then(fresh => {
+                if (!fresh || fresh.status === 'error') return;
+                memoryDbCache = fresh;
+                localStorage.setItem(appDbCacheKey(), JSON.stringify(fresh));
+                localStorage.setItem(appDbCacheTsKey(), String(Date.now()));
+                window.dispatchEvent(new CustomEvent('dbCacheRefreshed', { detail: fresh }));
+            }).catch(err => console.warn('تعذر إصلاح كاش الموظفين:', err));
+        } catch (e) {}
     }
     // Update the in-memory DB immediately when the user refreshes the cache.
     // No page reload is needed, so an unfinished report is not lost.
@@ -215,66 +265,474 @@ async function handleReportPage() {
     };
     window.showToast = showToast;
 
+    const spawnConfetti = (count = 90) => {
+        if (window.matchMedia('(prefers-reduced-motion: reduce)').matches) return;
+        const colors = ['#4f46e5', '#22d3ee', '#34d399', '#f59e0b', '#e11d48', '#a78bfa', '#0ea56f'];
+        const fragment = document.createDocumentFragment();
+        for (let i = 0; i < count; i++) {
+            const piece = document.createElement('span');
+            piece.className = 'confetti-piece';
+            piece.style.left = (Math.random() * 100).toFixed(2) + 'vw';
+            piece.style.background = colors[i % colors.length];
+            piece.style.setProperty('--drift', ((Math.random() * 90) - 45).toFixed(1) + 'px');
+            piece.style.animationDelay = (Math.random() * .45).toFixed(2) + 's';
+            piece.style.animationDuration = (2.2 + Math.random() * 1.6).toFixed(2) + 's';
+            fragment.appendChild(piece);
+        }
+        document.body.appendChild(fragment);
+        setTimeout(() => document.querySelectorAll('.confetti-piece').forEach(p => p.remove()), 5200);
+    };
+
+    // استعادة آخر نقطة — يحفظ بيانات سياق النقطة لصاحب الحساب الحالي.
+    const lastPointKey = () => ownerScopedKey('lastReportPoint');
+    const restoreLastPointBtn = document.getElementById('restoreLastPointBtn');
+    const refreshRestoreBtn = () => {
+        if (!restoreLastPointBtn) return;
+        // يظهر لكل موظف؛ بيانات النقطة نفسها تبقى منفصلة لكل حساب.
+        restoreLastPointBtn.classList.remove('d-none');
+    };
+    let lastPointSeedInProgress = false;
+    let lastPointSeedPromise = null;
+    // النسخ القديمة قد تحتوي المصفوفات الثلاث لكن من دون إصدار يثبت أن حفظ
+    // المعاملات اكتمل؛ إذا كانت المصفوفات كلها فارغة نرقّيها من أحدث تقرير محفوظ.
+    // أما أي نقطة حديثة (v2) فيُعتد حتى بالمصفوفات الفارغة لأنها قد تكون فارغة فعلاً.
+    const hasCompleteTransactionSnapshot = point => {
+        const hasArrays = Array.isArray(point?.sales) &&
+            Array.isArray(point?.salesOfCompetitor) && Array.isArray(point?.expenses);
+        if (!hasArrays) return false;
+        if (Number(point.transactionDataVersion) >= 2) return true;
+        return point.sales.length > 0 || point.salesOfCompetitor.length > 0 || point.expenses.length > 0;
+    };
+    const startLastPointSeed = () => {
+        if (!lastPointSeedInProgress) {
+            lastPointSeedInProgress = true;
+            lastPointSeedPromise = seedLastPointFromHistory();
+        }
+        return lastPointSeedPromise;
+    };
+    const saveLastPoint = (reportData) => {
+        const source = reportData || {
+            governorate: $('#governorate').val(),
+            region: $('#region').val(),
+            market: $('#market_name').val(),
+            campaign: $('#campaign').val(),
+            event: $('#event').val(),
+            eventDays: document.getElementById('eventDays').value,
+            coordinator: $('#coordinator').val(),
+            inventoryDependency: $('#inventoryDependency').val(),
+            supervisor: supervisorInput.value,
+            phoneNumber: document.getElementById('phoneNumber')?.value || '',
+            latitude: document.getElementById('latitude')?.value || '',
+            longitude: document.getElementById('longitude')?.value || ''
+        };
+        const point = {
+            governorate: source.governorate || '',
+            region: source.region || '',
+            market: source.market || '',
+            campaign: source.campaign || '',
+            event: source.event || '',
+            eventDays: source.eventDays || '1',
+            coordinator: source.coordinator || '',
+            inventoryDependency: source.inventoryDependency || '',
+            supervisor: source.supervisor || '',
+            phoneNumber: source.phoneNumber || '',
+            latitude: source.latitude || '',
+            longitude: source.longitude || ''
+        };
+        const transactionFields = ['sales', 'salesOfCompetitor', 'expenses'];
+        const hasCompleteTransactions = transactionFields.every(field => Array.isArray(source[field]));
+        const copyRows = (rows, fields) => rows.map(row => {
+            const copy = {};
+            fields.forEach(field => {
+                if (row && Object.prototype.hasOwnProperty.call(row, field)) copy[field] = row[field];
+            });
+            return copy;
+        });
+        if (!point.governorate || !point.market) return;
+        try {
+            localStorage.setItem(lastPointKey(), JSON.stringify({
+                ...point,
+                ...(hasCompleteTransactions ? {
+                    transactionDataVersion: 2,
+                    sales: copyRows(source.sales, ['product', 'price', 'quantity', 'campaign']),
+                    salesOfCompetitor: copyRows(source.salesOfCompetitor, ['product', 'price', 'quantity']),
+                    expenses: copyRows(source.expenses, ['item', 'quantity'])
+                } : {}),
+                savedAt: Date.now()
+            }));
+            refreshRestoreBtn();
+        } catch (error) {
+            console.warn('تعذر حفظ بيانات آخر نقطة محلياً:', error);
+        }
+    };
+    const applyLastPoint = async () => {
+        let last;
+        try { last = JSON.parse(localStorage.getItem(lastPointKey()) || ''); } catch (e) { return; }
+        // لا نعرض نقطة قديمة ذات موقع فقط بينما عملية ترقية بيانات المعاملات
+        // لم تكتمل؛ انتظر جلب آخر تقرير ثم أعد قراءة النسخة المحفوظة.
+        if (!hasCompleteTransactionSnapshot(last)) {
+            const seedPromise = startLastPointSeed();
+            if (seedPromise) {
+                showToast('جارٍ تحميل المبيعات ومبيعات المنافس والمصاريف لآخر نقطة...');
+                await seedPromise;
+                try { last = JSON.parse(localStorage.getItem(lastPointKey()) || ''); } catch (e) { return; }
+            }
+        }
+        if (!last) {
+            showToast('لا توجد نقطة محفوظة لهذا الحساب بعد.', true);
+            return;
+        }
+        const currentForm = getFormState();
+        const hasTransactionSnapshot = hasCompleteTransactionSnapshot(last);
+        const savedTransactions = hasTransactionSnapshot ? {
+            sales: last.sales,
+            salesOfCompetitor: last.salesOfCompetitor,
+            expenses: last.expenses
+        } : null;
+        const currentTransactions = {
+            sales: currentForm.sales || [],
+            salesOfCompetitor: currentForm.salesOfCompetitor || [],
+            expenses: currentForm.expenses || []
+        };
+        const hasUnsavedTransactions = [
+            ...currentTransactions.sales,
+            ...currentTransactions.salesOfCompetitor,
+            ...currentTransactions.expenses
+        ].some(item =>
+            String(item.product || item.item || '').trim() ||
+            Number(item.quantity || 0) > 0 ||
+            Number(item.price || 0) > 0
+        );
+        const changesTransactionContext = hasUnsavedTransactions && (
+            (Object.prototype.hasOwnProperty.call(last, 'campaign') &&
+                String(last.campaign || '') !== String(currentForm.campaign || '')) ||
+            (Object.prototype.hasOwnProperty.call(last, 'event') &&
+                String(last.event || '') !== String(currentForm.event || ''))
+        );
+        const transactionSignature = transactions => JSON.stringify({
+            sales: (transactions.sales || []).map(row => [
+                String(row?.product || ''), Number(row?.price || 0), Number(row?.quantity || 0)
+            ]),
+            salesOfCompetitor: (transactions.salesOfCompetitor || []).map(row => [
+                String(row?.product || ''), Number(row?.price || 0), Number(row?.quantity || 0)
+            ]),
+            expenses: (transactions.expenses || []).map(row => [
+                String(row?.item || ''), Number(row?.quantity || 0)
+            ])
+        });
+        const transactionDataDiffers = hasTransactionSnapshot &&
+            transactionSignature(currentTransactions) !== transactionSignature(savedTransactions);
+        const shouldConfirmTransactionReplacement = hasUnsavedTransactions &&
+            hasTransactionSnapshot && (transactionDataDiffers || changesTransactionContext);
+        if (shouldConfirmTransactionReplacement && !confirm(
+            'ستستعيد المبيعات ومبيعات المنافس والمصاريف المحفوظة مع هذه النقطة، وسيتم استبدال الأسطر الموجودة حالياً. هل تريد المتابعة؟'
+        )) return;
+        // إذا كانت نسخة النقطة قديمة ولا تتضمن جداول المعاملات، نحافظ على
+        // سياق معاملات النموذج الحالي بدلاً من مسحها عند تبديل الحملة/الحدث.
+        const preserveLegacyTransactionContext = hasUnsavedTransactions && !hasTransactionSnapshot;
+        const setPointSelect = (id, value) => {
+            if (value === undefined || value === null) return;
+            const select = document.getElementById(id);
+            if (!select) return;
+            const nextValue = String(value);
+            if (String($(select).val() ?? '') === nextValue) return;
+            if (nextValue && select.options && !Array.from(select.options).some(option => String(option.value) === nextValue)) {
+                const option = document.createElement('option');
+                option.value = nextValue;
+                option.textContent = nextValue;
+                select.appendChild(option);
+            } else if (nextValue && !select.options) {
+                const option = document.createElement('option');
+                option.value = nextValue;
+                option.textContent = nextValue;
+                select.appendChild(option);
+            }
+            $(select).val(nextValue || null).trigger('change');
+        };
+        stateRestoring = true;
+        setPointSelect('governorate', last.governorate);
+        setPointSelect('region', last.region);
+        setPointSelect('campaign', preserveLegacyTransactionContext ? currentForm.campaign : last.campaign);
+        setPointSelect('event', preserveLegacyTransactionContext ? currentForm.event : last.event);
+        setPointSelect('market_name', last.market);
+        if (last.eventDays) document.getElementById('eventDays').value = last.eventDays;
+        setPointSelect('coordinator', last.coordinator);
+        setPointSelect('inventoryDependency', last.inventoryDependency);
+        if (Object.prototype.hasOwnProperty.call(last, 'supervisor')) supervisorInput.value = last.supervisor || '';
+        if (document.getElementById('phoneNumber') && Object.prototype.hasOwnProperty.call(last, 'phoneNumber')) {
+            document.getElementById('phoneNumber').value = last.phoneNumber || '';
+        }
+        if (Object.prototype.hasOwnProperty.call(last, 'latitude') || Object.prototype.hasOwnProperty.call(last, 'longitude')) {
+            applyGpsToFields(last.latitude, last.longitude);
+        }
+        const dateEl = document.getElementById('date');
+        if (dateEl && !dateEl.value) dateEl.value = new Date().toISOString().slice(0, 10);
+        updateSalesVisibility();
+        if (typeof updateCompetitorSalesVisibility === 'function') updateCompetitorSalesVisibility();
+        if (hasTransactionSnapshot) {
+            salesTableBody.innerHTML = '';
+            if (competitorSalesTableBody) competitorSalesTableBody.innerHTML = '';
+            expensesTableBody.innerHTML = '';
+            (last.sales || []).forEach(createSaleRow);
+            (last.salesOfCompetitor || []).forEach(createCompetitorSaleRow);
+            (last.expenses || []).forEach(createExpenseRow);
+            updateSaleTotals();
+            updateCompetitorSaleTotals();
+            if (last.sales?.length && salesCard) salesCard.style.display = '';
+            if (last.salesOfCompetitor?.length && competitorSalesCard) competitorSalesCard.style.display = '';
+        }
+        stateRestoring = false;
+        isFormDirty = true;
+        saveFormState();
+        refreshRestoreBtn();
+        showToast(preserveLegacyTransactionContext
+            ? 'تمت استعادة موقع النقطة، وأبقينا المعاملات الحالية لأن النسخة المحفوظة لا تتضمن تفاصيلها.'
+            : hasTransactionSnapshot
+                ? 'تمت استعادة النقطة مع المبيعات ومبيعات المنافس والمصاريف.'
+                : 'تمت استعادة بيانات موقع النقطة، لكن لم تتوفر نسخة محفوظة من المعاملات؛ تحقق من الاتصال وأعد المحاولة.');
+    };
+    restoreLastPointBtn?.addEventListener('click', applyLastPoint);
+    const seedLastPointFromHistory = async () => {
+        const readSavedPoint = () => {
+            try { return JSON.parse(localStorage.getItem(lastPointKey()) || ''); } catch (e) { return null; }
+        };
+        if (hasCompleteTransactionSnapshot(readSavedPoint())) return;
+        const user = typeof getStoredUser === 'function' ? getStoredUser() : null;
+        if (!user || !user.id) return;
+        try {
+            let latest = null;
+            // If this account has a newer unsent report in IndexedDB, migrate from
+            // that complete local copy first so offline submissions are included.
+            if (typeof getPendingReports === 'function') {
+                try {
+                    const existingPoint = readSavedPoint();
+                    const savedAt = Number(existingPoint?.savedAt || 0);
+                    const pending = await getPendingReports();
+                    latest = (Array.isArray(pending) ? pending : [])
+                        .filter(item => item?.reportData &&
+                            String(item.reportData.createdById || '') === String(user.id) &&
+                            Number(item.createdAt || 0) >= savedAt)
+                        .sort((a, b) => Number(b.createdAt || 0) - Number(a.createdAt || 0))[0]?.reportData || null;
+                } catch (storageError) {
+                    console.warn('تعذر فحص تقارير هذا الحساب المحفوظة للمزامنة:', storageError);
+                }
+            }
+            const params = {
+                userId: String(user.id),
+                role: String(user.role || ''),
+                userName: String(user.name || ''),
+                targetUserId: String(user.id),
+                page: '1',
+                pageSize: '1'
+            };
+            if (!latest) {
+                const result = await apiGet('getReportsPage', params);
+                if (!result || result.status !== 'success' || !Array.isArray(result.items) || !result.items.length) return;
+                latest = result.items.find(report =>
+                    !report.createdById || String(report.createdById) === String(user.id)
+                );
+            }
+            // نحدّث كاش «آخر نقطة» إذا كانت بيانات المعاملات ناقصة حتى لو كان
+            // نموذج التقرير الحالي معدّلاً؛ هذا لا يمس المسودة (مفتاح مستقل) ولا يغيّر الحقول.
+            if (latest && !hasCompleteTransactionSnapshot(readSavedPoint())) saveLastPoint(latest);
+        } catch (error) {
+            console.warn('تعذر تهيئة نقطة الاستعادة من آخر تقرير:', error);
+        } finally {
+            lastPointSeedInProgress = false;
+        }
+    };
+    // النسخة الأولى لا تملك مفتاح lastReportPoint بعد؛ نأخذ أحدث تقرير لهذا
+    // الحساب مرة واحدة بالخلفية، أو نرقّي المفتاح القديم الذي لا يحوي جداول
+    // المعاملات، من دون تعطيل رسم الشاشة أو انتظار الشبكة.
+    setTimeout(() => {
+        const savedPoint = (() => {
+            try { return JSON.parse(localStorage.getItem(lastPointKey()) || ''); } catch (e) { return null; }
+        })();
+        if (!hasCompleteTransactionSnapshot(savedPoint)) startLastPointSeed();
+    }, 0);
+
+    // V62: موقع المحل (GPS) — التقاط مشترك يستخدمه الزر وعملية الإرسال.
+    const captureGps = () => new Promise((resolve) => {
+        if (!('geolocation' in navigator)) { resolve(null); return; }
+        const timeoutId = setTimeout(() => resolve(null), 4000);
+        navigator.geolocation.getCurrentPosition(
+            pos => { clearTimeout(timeoutId); resolve({ latitude: Number(pos.coords.latitude.toFixed(6)), longitude: Number(pos.coords.longitude.toFixed(6)) }); },
+            () => { clearTimeout(timeoutId); resolve(null); },
+            { enableHighAccuracy: false, timeout: 3500, maximumAge: 60000 }
+        );
+    });
+    const applyGpsToFields = (lat, lng) => {
+        const latEl = document.getElementById('latitude');
+        const lngEl = document.getElementById('longitude');
+        const link = document.getElementById('openMapsLink');
+        if (latEl) latEl.value = lat ? String(lat) : '';
+        if (lngEl) lngEl.value = lng ? String(lng) : '';
+        if (link) {
+            if (lat && lng) { link.classList.remove('d-none'); link.href = 'https://www.google.com/maps?q=' + encodeURIComponent(lat + ',' + lng); }
+            else link.classList.add('d-none');
+        }
+    };
+    const getLocationBtn = document.getElementById('getMyLocationBtn');
+    getLocationBtn?.addEventListener('click', async () => {
+        const status = document.getElementById('gpsStatus');
+        if (!('geolocation' in navigator)) { if (status) status.textContent = 'الموقع غير متاح على هذا الجهاز.'; return; }
+        if (status) status.textContent = 'جارٍ تحديد الموقع...';
+        getLocationBtn.disabled = true;
+        const pos = await captureGps();
+        getLocationBtn.disabled = false;
+        if (pos) {
+            applyGpsToFields(pos.latitude, pos.longitude);
+            if (status) status.textContent = 'تم تحديد الموقع.';
+            isFormDirty = true;
+            saveFormState();
+        } else {
+            applyGpsToFields(null, null);
+            if (status) status.textContent = 'تعذر تحديد الموقع — اسمح بالوصول إلى الموقع وحاول مجدداً.';
+        }
+    });
+
+    const formStateSavedAtKey = () => ownerScopedKey('reportFormLastStateSavedAt');
+    const clearFormDraft = () => {
+        try {
+            localStorage.removeItem(formStateKey());
+            localStorage.removeItem(formStateSavedAtKey());
+        } catch (e) { console.warn('تعذر حذف مسودة التقرير المحلية:', e); }
+    };
+    const showDraftStatus = (message, hideAfterMs = 3500) => {
+        const draft = document.getElementById('draftStatus');
+        if (!draft) return;
+        draft.textContent = message;
+        draft.classList.add('show');
+        clearTimeout(draft._hideTimer);
+        if (hideAfterMs > 0) draft._hideTimer = setTimeout(() => draft.classList.remove('show'), hideAfterMs);
+    };
+
     const getFormState = () => {
-        const loggedUser = JSON.parse(localStorage.getItem('currentUser')) || JSON.parse(sessionStorage.getItem('currentUser')) || {};
+        let loggedUser = {};
+        try { loggedUser = JSON.parse(localStorage.getItem('currentUser') || sessionStorage.getItem('currentUser') || '{}') || {}; } catch (e) {}
         const directPromotion = String($('#event').val() || '').trim() === 'ترويج مباشر';
         return {
-        governorate: $('#governorate').val(), region: $('#region').val(), market: $('#market_name').val(),
-        campaign: $('#campaign').val(), event: $('#event').val(),
-        eventDays: document.getElementById('eventDays').value, date: document.getElementById('date').value,
+        governorate: $('#governorate').val() || '', region: $('#region').val() || '', market: $('#market_name').val() || '',
+        campaign: $('#campaign').val() || '', event: $('#event').val() || '',
+        eventDays: document.getElementById('eventDays')?.value || '1', date: document.getElementById('date')?.value || '',
         phoneNumber: document.getElementById('phoneNumber')?.value.trim() || '',
-        timeFrom: document.getElementById('timeFrom').value, timeTo: document.getElementById('timeTo').value,
-        inventoryDependency: $('#inventoryDependency').val(), coordinator: $('#coordinator').val(),
-        promoter1: $('#promoter1').val(), promoter2: $('#promoter2').val(),
-        promoter3: $('#promoter3').val(), promoter4: $('#promoter4').val(),
+        timeFrom: document.getElementById('timeFrom')?.value || '', timeTo: document.getElementById('timeTo')?.value || '',
+        inventoryDependency: $('#inventoryDependency').val() || '', coordinator: $('#coordinator').val() || '',
+        supervisor: supervisorInput?.value || '',
+        promoter1: $('#promoter1').val() || '', promoter2: $('#promoter2').val() || '',
+        promoter3: $('#promoter3').val() || '', promoter4: $('#promoter4').val() || '',
+        latitude: document.getElementById('latitude')?.value?.trim() || '',
+        longitude: document.getElementById('longitude')?.value?.trim() || '',
         promoters: getSelectedPromoters(),
-        notes: document.getElementById('notes').value,
-        sales: directPromotion ? [] : Array.from(salesTableBody.querySelectorAll('tr')).map(r => ({ product: $(r.querySelector('.sale-product')).val(), price: Number(r.querySelector('.sale-price').value) || 0, quantity: Number(r.querySelector('.sale-quantity').value) || 0, campaign: $('#campaign').val() })),
-        salesOfCompetitor: Array.from(document.querySelectorAll('#competitor-sales-table-body tr')).map(r => ({ product: $(r.querySelector('.competitor-product')).val(), price: Number(r.querySelector('.competitor-price').value) || 0, quantity: Number(r.querySelector('.competitor-quantity').value) || 0 })),
-        expenses: Array.from(expensesTableBody.querySelectorAll('tr')).map(r => ({ item: $(r.querySelector('.expense-item')).val(), quantity: r.querySelector('.expense-quantity').value })),
+        notes: document.getElementById('notes')?.value || '',
+        sales: directPromotion ? [] : Array.from(salesTableBody.querySelectorAll('tr')).map(r => ({ product: $(r.querySelector('.sale-product')).val() || '', price: Number(r.querySelector('.sale-price')?.value) || 0, quantity: Number(r.querySelector('.sale-quantity')?.value) || 0, campaign: $('#campaign').val() || '' })),
+        salesOfCompetitor: Array.from(document.querySelectorAll('#competitor-sales-table-body tr')).map(r => ({ product: $(r.querySelector('.competitor-product')).val() || '', price: Number(r.querySelector('.competitor-price')?.value) || 0, quantity: Number(r.querySelector('.competitor-quantity')?.value) || 0 })),
+        expenses: Array.from(expensesTableBody.querySelectorAll('tr')).map(r => ({ item: $(r.querySelector('.expense-item')).val() || '', quantity: r.querySelector('.expense-quantity')?.value ?? '' })),
         createdById: loggedUser.id || '',
         createdByName: loggedUser.name || '',
         };
     };
-    const saveFormState = () => { if (isFormDirty) { localStorage.setItem(FORM_STATE_KEY, JSON.stringify(getFormState())); } };
+    const saveFormState = () => {
+        // During initial rendering and restoration, synthetic change events must
+        // not overwrite the user's saved draft with a blank or half-built form.
+        if (!isFormDirty || stateRestoring || isFormInitializing) return;
+        const draft = document.getElementById('draftStatus');
+        try {
+            localStorage.setItem(formStateKey(), JSON.stringify(getFormState()));
+            localStorage.setItem(formStateSavedAtKey(), String(Date.now()));
+        } catch (error) {
+            console.warn('تعذر حفظ مسودة التقرير محلياً:', error);
+            if (draft) showDraftStatus('تعذر حفظ المسودة — تحقق من مساحة التخزين', 0);
+            return;
+        }
+        if (draft) showDraftStatus('✓ تُحفظ المسودة تلقائياً', 1600);
+    };
     const loadFormState = () => {
-        const savedState = localStorage.getItem(FORM_STATE_KEY);
-        if (!savedState) return;
-        const state = JSON.parse(savedState);
-        $('#campaign').val(state.campaign).trigger('change');
-        $('#event').val(state.event).trigger('change');
-        document.getElementById('eventDays').value = state.eventDays;
-        document.getElementById('date').value = state.date;
-        document.getElementById('timeFrom').value = state.timeFrom;
-        document.getElementById('timeTo').value = state.timeTo;
-        document.getElementById('notes').value = state.notes;
-        if (document.getElementById('phoneNumber')) document.getElementById('phoneNumber').value = state.phoneNumber || '';
-        $('#inventoryDependency').val(state.inventoryDependency).trigger('change');
-        $('#coordinator').val(state.coordinator).trigger('change');
-        $('#promoter1').val(state.promoter1).trigger('change');
-        $('#promoter2').val(state.promoter2).trigger('change');
-        $('#promoter3').val(state.promoter3).trigger('change');
-        setSelectedPromoters([state.promoter1, state.promoter2, state.promoter3, state.promoter4]);
-        if (state.governorate) {
-            $('#governorate').val(state.governorate).trigger('change');
-            if (state.region) {
-                $('#region').val(state.region).trigger('change');
-                if (state.market) {
-                    $('#market_name').val(state.market).trigger('change');
+        let state;
+        const savedState = localStorage.getItem(formStateKey());
+        if (!savedState) return false;
+        try {
+            state = JSON.parse(savedState);
+            if (!state || typeof state !== 'object' || Array.isArray(state)) throw new Error('صيغة المسودة غير صالحة');
+        } catch (error) {
+            console.warn('مسودة محفوظة تالفة؛ سيتم تجاهلها:', error);
+            clearFormDraft();
+            showDraftStatus('تعذر قراءة المسودة السابقة؛ يمكنك البدء من جديد.', 5000);
+            return false;
+        }
+
+        stateRestoring = true;
+        try {
+            $('#campaign').val(state.campaign || '').trigger('change');
+            $('#event').val(state.event || '').trigger('change');
+            document.getElementById('eventDays').value = state.eventDays || '1';
+            document.getElementById('date').value = state.date || '';
+            document.getElementById('timeFrom').value = state.timeFrom || '';
+            document.getElementById('timeTo').value = state.timeTo || '';
+            document.getElementById('notes').value = state.notes || '';
+            if (document.getElementById('phoneNumber')) document.getElementById('phoneNumber').value = state.phoneNumber || '';
+            applyGpsToFields(state.latitude || '', state.longitude || '');
+            $('#inventoryDependency').val(state.inventoryDependency || '').trigger('change');
+            $('#coordinator').val(state.coordinator || '').trigger('change');
+            // inventoryDependency can set a default supervisor; restore the user's
+            // actual value afterwards so manual changes also survive app closure.
+            if (supervisorInput && state.supervisor !== undefined) supervisorInput.value = state.supervisor || '';
+            if (state.governorate) {
+                $('#governorate').val(state.governorate).trigger('change');
+                if (state.region) {
+                    $('#region').val(state.region).trigger('change');
+                    if (state.market) $('#market_name').val(state.market).trigger('change');
                 }
             }
+            // Restore the exact saved people list rather than only the four legacy fields.
+            setSelectedPromoters(Array.isArray(state.promoters)
+                ? state.promoters
+                : [state.promoter1, state.promoter2, state.promoter3, state.promoter4]);
+            salesTableBody.innerHTML = '';
+            if (Array.isArray(state.sales)) state.sales.forEach(createSaleRow);
+            if (competitorSalesTableBody) competitorSalesTableBody.innerHTML = '';
+            if (Array.isArray(state.salesOfCompetitor) && typeof createCompetitorSaleRow === 'function') state.salesOfCompetitor.forEach(createCompetitorSaleRow);
+            expensesTableBody.innerHTML = '';
+            if (Array.isArray(state.expenses)) state.expenses.forEach(createExpenseRow);
+            updateSaleTotals();
+            if (typeof updateCompetitorSaleTotals === 'function') updateCompetitorSaleTotals();
+            if (typeof updateSalesVisibility === 'function') updateSalesVisibility();
+            if (typeof updateCompetitorSalesVisibility === 'function') updateCompetitorSalesVisibility();
+            isFormDirty = true;
+            const savedAt = Number(localStorage.getItem(formStateSavedAtKey()) || 0);
+            const when = savedAt ? new Date(savedAt).toLocaleString() : '';
+            showDraftStatus(`✓ تمت استعادة مسودة التقرير تلقائياً${when ? ` — آخر حفظ: ${when}` : ''}`, 6000);
+            return true;
+        } catch (error) {
+            console.error('تعذر استعادة مسودة التقرير:', error);
+            showDraftStatus('تعذر استعادة بعض بيانات المسودة؛ راجع الحقول قبل الإرسال.', 6000);
+            return false;
+        } finally {
+            stateRestoring = false;
         }
-        salesTableBody.innerHTML = '';
-        if (state.sales) state.sales.forEach(createSaleRow);
-        if (state.salesOfCompetitor && typeof createCompetitorSaleRow === 'function') state.salesOfCompetitor.forEach(createCompetitorSaleRow);
-        expensesTableBody.innerHTML = '';
-        if (state.expenses) state.expenses.forEach(createExpenseRow);
-        updateSaleTotals();
-        isFormDirty = true;
     };
 
-    reportForm.addEventListener('input', () => { isFormDirty = true; saveFormState(); });
-    window.addEventListener('beforeunload', (event) => { if (isFormDirty) { event.preventDefault(); event.returnValue = ''; } });
+    reportForm.addEventListener('input', () => {
+        if (stateRestoring || isFormInitializing) return;
+        isFormDirty = true;
+        saveFormState();
+    });
+    reportForm.addEventListener('change', () => {
+        refreshRestoreBtn();
+        if (stateRestoring || isFormInitializing) return;
+        isFormDirty = true;
+        saveFormState();
+    });
+    refreshRestoreBtn();
+    // localStorage writes are synchronous, and these lifecycle hooks provide a
+    // final safety net for PWA close, tab close, app switching and OS suspension.
+    const persistDraftOnExit = () => { if (isFormDirty) saveFormState(); };
+    window.addEventListener('beforeunload', persistDraftOnExit); // deliberately do not block closing the app
+    window.addEventListener('pagehide', persistDraftOnExit);
+    window.addEventListener('freeze', persistDraftOnExit);
+    document.addEventListener('visibilitychange', () => {
+        if (document.visibilityState === 'hidden') persistDraftOnExit();
+    });
 
     const escapeHtml = (value) => String(value ?? '').replace(/[&<>"']/g, char => ({
         '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#039;'
@@ -295,15 +753,61 @@ async function handleReportPage() {
     const populateSelect = (select, options, selectedVal = '') => {
         const currentVal = $(select).val();
         const placeholder = select.querySelector('option[disabled]').textContent;
-        select.innerHTML = `<option value="" selected disabled>${placeholder}</option>`;
-        if (select.id.startsWith('promoter') || select.id === 'inventoryDependency' || select.id === 'coordinator') { select.innerHTML += `<option value="">غير محدد</option>`; }
-        options.forEach(opt => select.innerHTML += `<option value="${opt}" ${opt === selectedVal ? 'selected' : ''}>${opt}</option>`);
+        // اجمع الخيارات في مصفوفة ثم اكتبها دفعة واحدة. `innerHTML +=` داخل
+        // حلقة يُعيد تحليل HTML المجمَّع مع كل خيار، فالتكلفة O(n^2): 200 خيار
+        // تعيد تحليل ~1.1 ميغابايت. الإسناد الواحد تحليل واحد.
+        const parts = [`<option value="" selected disabled>${placeholder}</option>`];
+        if (select.id.startsWith('promoter') || select.id === 'inventoryDependency' || select.id === 'coordinator') {
+            parts.push(`<option value="">غير محدد</option>`);
+        }
+        for (const opt of options) {
+            parts.push(`<option value="${opt}" ${opt === selectedVal ? 'selected' : ''}>${opt}</option>`);
+        }
+        select.innerHTML = parts.join('');
         $(select).val(selectedVal || currentVal).trigger('change.select2');
     };
     const isValidPromoterName = (value) => {
         if (value === null || value === undefined) return false;
         const name = String(value).trim();
         return !!name && name.toLowerCase() !== 'undefined' && name.toLowerCase() !== 'null' && name !== '-';
+    };
+
+    const PROMOTERS_REQUIRED_MESSAGE = 'يجب اختيار شخص واحد على الأقل ضمن الأشخاص المتواجدين بالنقطة';
+
+    /**
+     * «الأشخاص المتواجدين ضمن النقطة» is required.
+     *
+     * The value lives in four hidden inputs, and an input[type=hidden] is barred
+     * from constraint validation: `required` and setCustomValidity on it are
+     * both ignored, so checkValidity() would pass with nobody selected. The rule
+     * is therefore enforced explicitly at the submit gate and mirrored on the
+     * button, which is the control the user can actually see and act on.
+     */
+    const validatePromotersPresence = () => {
+        const present = getSelectedPromoters().length > 0;
+        const btn = document.getElementById('openPromotersBtn');
+        const hint = document.getElementById('promotersRequiredHint');
+        const label = document.getElementById('promotersLabel');
+        if (btn) btn.classList.toggle('is-invalid', !present);
+        if (hint) hint.classList.toggle('d-none', present);
+        if (label) label.classList.toggle('text-danger', !present);
+        return present;
+    };
+
+    /**
+     * The coordinator is by definition present at their own point, so they are
+     * added to the list by default.
+     *
+     * This is a default, not a lock: the row stays tickable-off in the picker,
+     * which is what keeps the required rule meaningful. It only ever adds, so
+     * it can never silently drop a name the user chose.
+     */
+    const includeCoordinatorAsPromoter = () => {
+        const coordinatorName = String(document.getElementById('coordinator')?.value || '').trim();
+        if (!isValidPromoterName(coordinatorName)) return;
+        // Prepended, because setSelectedPromoters keeps only four names: the
+        // coordinator has to displace the last entry, not be the one dropped.
+        setSelectedPromoters([coordinatorName, ...getSelectedPromoters()]);
     };
 
     const normalizePromoterNames = (names = []) => [...new Set(
@@ -330,13 +834,18 @@ async function handleReportPage() {
 
     const populateEmployees = (report = {}) => {
         const inventoryStaff = DB.employees.filter(e => e.role === 'مسؤول جرد').map(e => e.name);
-        const coordinators = DB.employees.filter(e => e.role === 'منسق نقطة').map(e => e.name);
+        const coordinators = DB.employees.filter(e => e.role === 'منسق نقطة' || e.role === 'مسؤول جرد').map(e => e.name);
         populateSelect(document.getElementById('inventoryDependency'), inventoryStaff, report.inventoryDependency);
         populateSelect(document.getElementById('coordinator'), coordinators, report.coordinator);
         const reportPromoters = Array.isArray(report.promoters)
             ? report.promoters
             : [report.promoter1, report.promoter2, report.promoter3, report.promoter4];
         setSelectedPromoters(normalizePromoterNames(reportPromoters));
+        // After the saved list, not before: populateSelect fires change on the
+        // coordinator, but this must win over the report's own promoters so a
+        // report saved before the coordinator was in the list still ends up
+        // with them present.
+        includeCoordinatorAsPromoter();
     };
 
     const promotersSelectionModal = new bootstrap.Modal(document.getElementById('promotersSelectionModal'));
@@ -346,12 +855,30 @@ async function handleReportPage() {
     const openPromotersBtn = document.getElementById('openPromotersBtn');
     const savePromotersBtn = document.getElementById('savePromotersBtn');
 
+    const isPromoterRoleValue = (value) => {
+        const s = String(value ?? '').trim();
+        return s === 'مروج' || s === 'مروّج' || /^(promoter|promoters)$/i.test(s);
+    };
+    const isCoordinatorRoleValue = (value) => {
+        const s = String(value ?? '').trim();
+        return s === 'منسق نقطة' || /^(coordinator|coordinators)$/i.test(s);
+    };
     const renderPromotersSelection = () => {
-        const promoters = (Array.isArray(DB.employees) ? DB.employees : [])
-            .filter(e => e && String(e.role || '').trim() === 'مروج')
+        const employees = Array.isArray(DB && DB.employees) ? DB.employees : [];
+        const supervisorName = (supervisorInput?.value || '').trim();
+        let promoters = employees
+            .filter(e => e && (isPromoterRoleValue(e.role ?? e.jobPosition ?? '') || isCoordinatorRoleValue(e.role ?? e.jobPosition ?? '')))
             .map(e => String(e.name ?? '').trim())
             .filter(isValidPromoterName)
             .filter((name, index, arr) => arr.indexOf(name) === index);
+        // كل الموظفين التابعين للمشرف المعروض في خانة "المشرف" يُضافون للقائمة.
+        if (supervisorName) {
+            const teamNames = employees
+                .filter(e => e && String(e.mgr ?? '').trim() === supervisorName)
+                .map(e => String(e.name ?? '').trim())
+                .filter(isValidPromoterName);
+            promoters = [...promoters, ...teamNames].filter((name, index, arr) => arr.indexOf(name) === index);
+        }
         const selected = new Set(getSelectedPromoters());
         promotersSelectionTbody.innerHTML = '';
         const query = (promotersSearchInput?.value || '').toLowerCase().trim();
@@ -379,6 +906,13 @@ async function handleReportPage() {
         promotersSelectionModal.show();
     });
     promotersSearchInput?.addEventListener('input', renderPromotersSelection);
+    // The coordinator belongs among the people present, so choosing one fills
+    // the list without the user having to open the picker.
+    document.getElementById('coordinator')?.addEventListener('change', () => {
+        includeCoordinatorAsPromoter();
+        isFormDirty = true;
+        saveFormState();
+    });
     savePromotersBtn?.addEventListener('click', () => {
         const selected = Array.from(promotersSelectionTbody.querySelectorAll('.promoter-checkbox:checked')).map(cb => cb.value);
         // إذا كانت القائمة مفلترة، نحافظ على الاختيارات الموجودة خارج نتيجة البحث.
@@ -387,6 +921,7 @@ async function handleReportPage() {
         visibleNames.forEach(name => current.delete(name));
         selected.forEach(name => current.add(name));
         setSelectedPromoters(Array.from(current));
+        validatePromotersPresence();
         isFormDirty = true;
         saveFormState();
         promotersSelectionModal.hide();
@@ -415,31 +950,142 @@ async function handleReportPage() {
         return value === 'true' || value === '1' || value === 'yes' || value === 'نعم';
     };
 
-    const getCampaignProducts = () => {
-        const campaignName = campaignSelect.value;
-        let products = [];
-        if (campaignName === 'شاملة'||campaignName === 'مهرجان') {
-            const allProducts = new Map();
-            Object.values(DB.products || {}).flat().forEach(p => {
-                if (p && p.name) allProducts.set(p.name, p);
-            });
-            products = Array.from(allProducts.values());
-        } else {
-            products = DB.products?.[campaignName] || [];
-        }
-        return products.filter(p => p && p.name && !isCancelledProduct(p));
-    };
+    // «شاملة» و«مهرجان» حملتان تجميعيتان: تغطّيان كل مواد كل الحملات، وليس لهما
+    // صفوف خاصة بهما في ورقة Products. أي اختلاف في المعالجة بينهما كان يُظهر
+    // قائمة مواد فارغة أو يرفض حفظ السعر.
+    const AGGREGATE_CAMPAIGNS = ['شاملة', 'مهرجان'];
+    const isAggregateCampaign = (name) => AGGREGATE_CAMPAIGNS.includes(String(name ?? '').trim());
 
     const normalizeCategory = (value) => String(value ?? '')
         .trim()
         .replace(/\s+/g, ' ');
-    const getSaleProducts = () => getCampaignProducts().filter(p => normalizeCategory(p.category) === 'مادة بيعية');
+
+    // تصنيف مرن: ورقة Products قد تفتقد عمود «تصنيف المادة» أو تستعمل صيغة أخرى،
+    // والمطابقة بالنص الحرفي كانت تُفرغ القائمة بالكامل. نُطبّع ما نستطيعه.
+    const CATEGORY_SALE = 'مادة بيعية';
+    const CATEGORY_TASTING = 'مادة تذوق';
+    const classifyCategory = (value) => {
+        const raw = normalizeCategory(value);
+        if (!raw) return '';
+        const t = raw.toLowerCase();
+        if (/(بيع|بيعه|sale|sell)/.test(t)) return CATEGORY_SALE;
+        if (/(تذوق|tast|sampl)/.test(t)) return CATEGORY_TASTING;
+        return raw;
+    };
+    const isSaleCategory = (value) => classifyCategory(value) === CATEGORY_SALE;
+    const isTastingCategory = (value) => classifyCategory(value) === CATEGORY_TASTING;
+
+    // اتحاد كل الحملات مع دمج صفّ واحد لكل اسم مادة.
+    // كان آخر صف يفوز فقط، فمادة «مادة تذوق» في حملة لاحقة كانت تُخفي نسخة
+    // «مادة بيعية» لنفس الاسم من قائمة البيع داخل الحملات التجميعية.
+    const getAllProductsMerged = () => {
+        const merged = new Map();
+        Object.values(DB.products || {}).flat().forEach(p => {
+            if (!p || !p.name || isCancelledProduct(p)) return;
+            const name = String(p.name).trim();
+            const category = classifyCategory(p.category);
+            const found = merged.get(name);
+            if (!found) {
+                merged.set(name, { ...p, name, category });
+                return;
+            }
+            // ادمج سمات الاسم: إن كان بيعاً أو تذوقاً في أي حملة يبقى كذلك هنا.
+            const mergedCats = new Set([found.category, category].filter(Boolean));
+            found.category = Array.from(mergedCats).join('، ');
+            if (!normalizeBarcode(found.barcode) && normalizeBarcode(p.barcode)) found.barcode = p.barcode;
+            if (!Number(found.price) && Number(p.price)) found.price = Number(p.price);
+            if (!normalizeCategory(found.company) && normalizeCategory(p.company)) found.company = p.company;
+        });
+        return Array.from(merged.values());
+    };
+
+    const getCampaignProducts = () => {
+        const campaignName = campaignSelect.value;
+        const products = isAggregateCampaign(campaignName)
+            ? getAllProductsMerged()
+            : (DB.products?.[campaignName] || []);
+        return products.filter(p => p && p.name && !isCancelledProduct(p));
+    };
+
+    // للحملات التجميعية تُعرض كل المواد (بيعاً كان أم تذوقاً) لأن الحملة تغطّي الكل.
+    // للحملات العادية نفلتر بالتصنيف، وإن خرجت القائمة فارغة نُظهر كل مواد الحملة
+    // بدل ترك المستخدم أمام قائمة فارغة.
+    const pickByCategory = (predicate) => {
+        const products = getCampaignProducts();
+        if (isAggregateCampaign(campaignSelect.value)) return products;
+        const matched = products.filter(p => predicate(p.category));
+        return matched.length ? matched : products;
+    };
+
+    const getSaleProducts = () => pickByCategory(isSaleCategory);
     const isDirectSaleEvent = () => String($('#event').val() || '').trim() === 'ترويج وبيع مباشر';
-    const getSaleDisplayPrice = (product) => isDirectSaleEvent() ? Number(product?.price || 0) : '';
+    const getSaleDisplayPrice = (product) => {
+        const campaign = String(campaignSelect.value || '').trim();
+        const productName = String(product?.name || '').trim();
+        const key = userProductPriceScopeKey(campaign, productName);
+        const personal = userProductPricesByKey.get(key);
+        return resolveReportSalePrice($('#event').val(), product?.price, personal?.price);
+    };
+    const refreshSaleOptionPrices = () => {
+        const products = getSaleProducts();
+        salesTableBody.querySelectorAll('.sale-product').forEach(select => {
+            Array.from(select.options || []).forEach(option => {
+                if (!option.value) return;
+                const product = products.find(p => String(p.name) === String(option.value));
+                if (product) option.dataset.price = String(getSaleDisplayPrice(product));
+            });
+        });
+    };
+    const refreshUneditedNewSaleRows = () => {
+        let changed = false;
+        salesTableBody.querySelectorAll('tr').forEach(row => {
+            if (row.dataset.priceRefreshable !== 'true' || row.dataset.priceManuallyEdited === 'true') return;
+            const productName = String($(row.querySelector('.sale-product')).val() || '').trim();
+            const product = getSaleProducts().find(p => String(p.name) === productName);
+            if (!product) return;
+            row.querySelector('.sale-price').value = getSaleDisplayPrice(product).toFixed(2);
+            changed = true;
+        });
+        if (changed) updateSaleTotals();
+    };
+    // Personal prices are not on the critical path for showing the report form.
+    // When the server responds, update selectable prices and only rows that were
+    // just added from the picker/scanner and have not been manually edited.
+    userProductPricesRequest.then(userPricesResponse => {
+        if (userPricesResponse?.status !== 'success' || !Array.isArray(userPricesResponse.prices)) return;
+        replaceUserProductPrices(userPricesResponse.prices);
+        saveUserProductPricesCache();
+        refreshSaleOptionPrices();
+        refreshUneditedNewSaleRows();
+    }).catch(error => {
+        console.warn('تعذر تحميل الأسعار الشخصية في الخلفية؛ ستبقى أسعار الكاش/Products متاحة:', error);
+    });
+    window.addEventListener('appDataRefreshed', () => {
+        try {
+            const cached = JSON.parse(localStorage.getItem(userProductPriceCacheKey()) || '[]');
+            replaceUserProductPrices(cached);
+            refreshSaleOptionPrices();
+        } catch (e) { console.warn('تعذر إعادة تحميل أسعار المستخدم من الكاش:', e); }
+    });
+    const rememberUserProductPricesFromReport = (reportData) => {
+        if (String(reportData?.event || '').trim() === 'ترويج وبيع مباشر') return;
+        const fallbackCampaign = String(reportData?.campaign || '').trim();
+        (Array.isArray(reportData?.sales) ? reportData.sales : []).forEach(sale => {
+            const campaign = String(sale?.campaign || fallbackCampaign).trim();
+            const product = String(sale?.product || '').trim();
+            const price = Number(sale?.price);
+            if (!campaign || !product || !Number.isFinite(price) || price < 0) return;
+            userProductPricesByKey.set(userProductPriceScopeKey(campaign, product), {
+                campaign, product, barcode: String(sale?.barcode || '').trim(), price
+            });
+        });
+        saveUserProductPricesCache();
+        refreshSaleOptionPrices();
+    };
     const getCompetitorProducts = () => Array.isArray(DB.competitorProducts)
         ? DB.competitorProducts.filter(p => p && p.name && !isCancelledProduct(p))
         : [];
-    const getTastingProducts = () => getCampaignProducts().filter(p => normalizeCategory(p.category) === 'مادة تذوق');
+    const getTastingProducts = () => pickByCategory(isTastingCategory);
 
     const normalizeBarcode = (value) => String(value ?? '').trim();
 
@@ -484,6 +1130,33 @@ async function handleReportPage() {
         if (input) setTimeout(() => input.focus(), 50);
     };
 
+    let scanAudioCtx = null;
+    const playScanBeep = (success = true) => {
+        try {
+            scanAudioCtx = scanAudioCtx || new (window.AudioContext || window.webkitAudioContext)();
+            if (scanAudioCtx.state === 'suspended') scanAudioCtx.resume();
+            const now = scanAudioCtx.currentTime;
+            const osc = scanAudioCtx.createOscillator();
+            const gain = scanAudioCtx.createGain();
+            osc.type = 'sine';
+            osc.frequency.setValueAtTime(success ? 880 : 220, now);
+            if (success) osc.frequency.exponentialRampToValueAtTime(1320, now + 0.12);
+            gain.gain.setValueAtTime(0.0001, now);
+            gain.gain.exponentialRampToValueAtTime(0.16, now + 0.015);
+            gain.gain.exponentialRampToValueAtTime(0.0001, now + 0.18);
+            osc.connect(gain).connect(scanAudioCtx.destination);
+            osc.start(now);
+            osc.stop(now + 0.2);
+        } catch (e) {}
+    };
+
+    const flashSaleRow = (row) => {
+        if (!row) return;
+        row.classList.remove('row-flash');
+        void row.offsetWidth;
+        row.classList.add('row-flash');
+    };
+
     const addProductToSalesByBarcode = (rawBarcode) => {
         const barcode = normalizeBarcode(rawBarcode);
         const status = document.getElementById('barcodeStatus');
@@ -504,6 +1177,7 @@ async function handleReportPage() {
             status.textContent = 'يرجى اختيار نوع الحملة أولاً.';
             status.className = 'small mt-2 text-danger';
             showToast('يرجى اختيار نوع الحملة أولاً.', true);
+            playScanBeep(false);
             focusBarcodeInput();
             return false;
         }
@@ -513,6 +1187,7 @@ async function handleReportPage() {
             status.textContent = `الباركود ${barcode} غير موجود ضمن منتجات الحملة الحالية.`;
             status.className = 'small mt-2 text-danger';
             showToast(`الباركود ${barcode} غير موجود.`, true);
+            playScanBeep(false);
             focusBarcodeInput();
             return false;
         }
@@ -525,17 +1200,22 @@ async function handleReportPage() {
             updateSaleTotals();
             status.textContent = `تمت زيادة كمية «${product.name}» إلى ${quantityInput.value}.`;
             status.className = 'small mt-2 text-success';
+            flashSaleRow(existingRow);
+            showToast(`تم مسح «${product.name}» مجدداً — الكمية أصبحت ${quantityInput.value}.`);
         } else {
             createSaleRow({
                 product: product.name,
                 price: product.price,
                 quantity: 1,
-                barcode: barcode
+                barcode: barcode,
+                _refreshPriceOnLoad: true
             });
             status.textContent = `تمت إضافة «${product.name}» بسعر ${Number(product.price || 0).toFixed(2)} × 1.`;
             status.className = 'small mt-2 text-success';
+            flashSaleRow(salesTableBody.querySelector('tr:last-child'));
         }
 
+        playScanBeep(true);
         isFormDirty = true;
         saveFormState();
         const input = document.getElementById('barcodeInput');
@@ -544,70 +1224,91 @@ async function handleReportPage() {
         return true;
     };
 
-    let priceUpdateTimer = null;
-    const updateMasterProductPrice = async (row) => {
-        if (!navigator.onLine) return;
-        if (!isDirectSaleEvent()) return;
+    const pendingUserPriceSaveRequests = new Set();
+    const userPriceSaveSequenceByKey = new Map();
+    const updateUserProductPrice = async (row) => {
+        // سعر هذا النوع من الحدث يتبع Products المشتركة فقط؛ لا تحفظه كسعر شخصي.
+        if (isDirectSaleEvent() || !navigator.onLine || !row || !row.isConnected) return;
 
         const productSelect = row.querySelector('.sale-product');
         const product = String($(productSelect).val() || '').trim();
         const price = Number(row.querySelector('.sale-price')?.value);
         const campaign = String(campaignSelect.value || '').trim();
         const barcode = normalizeBarcode($(productSelect).find('option:selected').data('barcode') || '');
-
         if (!product || !campaign || !Number.isFinite(price) || price < 0) return;
 
+        const selectedProduct = product;
+        const scopeKey = userProductPriceScopeKey(campaign, selectedProduct);
+        const saveSequence = (userPriceSaveSequenceByKey.get(scopeKey) || 0) + 1;
+        userPriceSaveSequenceByKey.set(scopeKey, saveSequence);
         try {
-            const res = await fetch(SCRIPT_URL, {
-                method: 'POST',
-                headers: { 'Content-Type': 'text/plain;charset=utf-8' },
-                body: JSON.stringify({
-                    action: 'updateProductPrice',
-                    payload: { product, price, campaign, barcode }
-                }),
-                cache: 'no-store'
-            });
-            if (!res.ok) throw new Error(`HTTP ${res.status}`);
-            const result = await res.json();
-            if (result.status !== 'success') throw new Error(result.message || 'تعذر تحديث السعر');
+            const result = await apiPost('saveUserProductPrice', { product, price, campaign, barcode });
+            if (!result || result.status !== 'success') throw new Error(result?.message || 'تعذر حفظ السعر الشخصي');
 
-            // السعر أصبح محفوظاً في Products. أعد تحميل بيانات الموقع كاملة من الـSheet
-            // حتى يصبح السعر الجديد هو السعر المعتمد فوراً في الواجهة والباركود.
-            await refreshAppCache({ silent: true, refreshReports: false });
-
-            // حدّث الصف الحالي أيضاً من البيانات الجديدة، بدون إعادة فرض السعر القديم.
-            row.querySelector('.sale-price').value = Number(result.price).toFixed(2);
-            updateSaleTotals();
+            // لا نكتب أبداً إلى Products. خزّن السعر ضمن مفتاح المستخدم الحالي.
+            // نتجاهل الاستجابة الأقدم للمادة نفسها إذا سبقتها عملية حفظ أحدث.
+            if (userPriceSaveSequenceByKey.get(scopeKey) === saveSequence) {
+                userProductPricesByKey.set(scopeKey, { campaign, product, barcode, price });
+                saveUserProductPricesCache();
+                refreshSaleOptionPrices();
+            }
         } catch (error) {
-            console.error('Immediate price update failed:', error);
-            showToast(`تعذر تحديث سعر «${product}» على الشيت: ${error.message || error}`, true);
+            console.error('Personal product price update failed:', error);
+            showToast(`تعذر حفظ السعر الخاص بك للمادة «${product}»: ${error.message || error}`, true);
         }
     };
 
-    const scheduleMasterProductPriceUpdate = (row) => {
-        clearTimeout(priceUpdateTimer);
-        priceUpdateTimer = setTimeout(() => updateMasterProductPrice(row), 120);
+    const scheduleUserProductPriceUpdate = (row) => {
+        if (!row) return;
+        clearTimeout(row._userProductPriceTimer);
+        row._userProductPriceTimer = setTimeout(() => {
+            row._userProductPriceTimer = null;
+            let request;
+            request = updateUserProductPrice(row).finally(() => pendingUserPriceSaveRequests.delete(request));
+            pendingUserPriceSaveRequests.add(request);
+        }, 650);
+    };
+
+    const flushPendingUserPriceSaves = async () => {
+        // عند إرسال التقرير، يُحفظ السعر النهائي مع المعاملات على الخادم. ألغِ
+        // المؤقتات التي لم تبدأ وانتظر الكتابات القائمة حتى لا تطغى كتابة قديمة.
+        salesTableBody.querySelectorAll('tr').forEach(row => {
+            clearTimeout(row._userProductPriceTimer);
+            row._userProductPriceTimer = null;
+        });
+        if (pendingUserPriceSaveRequests.size) {
+            await Promise.allSettled(Array.from(pendingUserPriceSaveRequests));
+        }
     };
 
     const createSaleRow = (sale = {}) => {
-        const products = getSaleProducts();
-        // لا نعيد مادة ملغاة/غير متاحة من حالة محلية قديمة.
+        let products = getSaleProducts();
+        // لا نُسقط صامتاً صفاً محفوظاً لم تعد مادته ضمن القائمة (تغيّر التصنيف مثلاً):
+        // نضيفها مؤقتاً حتى لا يفقد المستخدم بيانات تقرير قائم.
         if (sale.product && !products.some(p => p.name === sale.product)) {
-            return;
+            products = products.concat([{ name: sale.product, price: 0, barcode: '', category: '' }]);
         }
         const existingProducts = Array.from(salesTableBody.querySelectorAll('.sale-product')).map(select => $(select).val());
-        if (sale.product && existingProducts.includes(sale.product) && !sale.price) return;
+        if (!stateRestoring && sale.product && existingProducts.includes(sale.product) && !sale.price) return;
 
         const row = document.createElement('tr');
+        row.dataset.priceRefreshable = sale._refreshPriceOnLoad === true ? 'true' : 'false';
+        row.dataset.priceManuallyEdited = 'false';
         const productOptions = products.map(p => {
             const safeName = String(p.name ?? '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
             return `<option value="${safeName}" data-price="${getSaleDisplayPrice(p)}" data-barcode="${normalizeBarcode(p.barcode)}">${safeName}</option>`;
         }).join('');
-        const priceValue = isDirectSaleEvent() ? (sale.price !== undefined && sale.price !== '' ? Number(sale.price || 0).toFixed(2) : '0.00') : (sale.price !== undefined && sale.price !== '' ? Number(sale.price).toFixed(2) : '');
+        const defaultProduct = sale.product ? products.find(p => String(p.name) === String(sale.product)) : null;
+        const defaultPrice = defaultProduct ? getSaleDisplayPrice(defaultProduct) : '';
+        const priceValue = sale.price !== undefined && sale.price !== ''
+            ? Number(sale.price || 0).toFixed(2)
+            : (sale.product ? Number(defaultPrice || 0).toFixed(2) : (isDirectSaleEvent() ? '0.00' : ''));
         const quantityValue = sale.quantity !== undefined && sale.quantity !== '' ? sale.quantity : '';
 
         row.innerHTML = `<td><select class="form-select form-select-sm sale-product" required><option value="" selected disabled>اختر...</option>${productOptions}</select></td><td><input type="number" class="form-control form-control-sm sale-price" value="${priceValue}" step="0.01" required></td><td><input type="number" class="form-control form-control-sm sale-quantity" value="${quantityValue}" min="1" required></td><td><input type="text" class="form-control form-control-sm row-total" value="0.00" readonly></td><td><button type="button" class="btn btn-sm btn-outline-danger remove-row-btn"><i class="fa-solid fa-trash-can"></i></button></td>`;
         row.querySelector('.remove-row-btn').addEventListener('click', () => {
+            clearTimeout(row._userProductPriceTimer);
+            row._userProductPriceTimer = null;
             row.remove();
             updateSaleTotals();
             isFormDirty = true;
@@ -621,6 +1322,17 @@ async function handleReportPage() {
             const newPrice = $(this).find('option:selected').data('price');
             if (newPrice !== undefined && newPrice !== '') {
                 row.querySelector('.sale-price').value = parseFloat(newPrice).toFixed(2);
+                row.dataset.priceManuallyEdited = 'false';
+            }
+            if (row.dataset.initializingSaleRow !== 'true') row.dataset.priceRefreshable = 'true';
+            if (!stateRestoring) {
+                const chosen = String($(this).val() || '');
+                const alreadyPresent = chosen && Array.from(salesTableBody.querySelectorAll('tr'))
+                    .some(r => r !== row && $(r.querySelector('.sale-product')).val() === chosen);
+                if (alreadyPresent) {
+                    flashSaleRow(row);
+                    showToast('انتبه: هذه المادة مذكورة في أكثر من صف ضمن الجدول.', false);
+                }
             }
             updateSaleTotals();
             isFormDirty = true;
@@ -633,28 +1345,39 @@ async function handleReportPage() {
             saveFormState();
         });
         row.querySelector('.sale-price').addEventListener('input', () => {
+            row.dataset.priceManuallyEdited = 'true';
             updateSaleTotals();
             isFormDirty = true;
             saveFormState();
-            // تحديث السعر المعتمد تلقائياً بعد توقف المستخدم عن الكتابة.
-            scheduleMasterProductPriceUpdate(row);
+            // حفظ السعر ضمن حساب المستخدم الحالي بعد توقف الكتابة.
+            scheduleUserProductPriceUpdate(row);
         });
         row.querySelector('.sale-price').addEventListener('change', () => {
+            row.dataset.priceManuallyEdited = 'true';
             updateSaleTotals();
             isFormDirty = true;
             saveFormState();
-            scheduleMasterProductPriceUpdate(row);
+            scheduleUserProductPriceUpdate(row);
         });
 
         salesTableBody.appendChild(row);
-        if (sale.product) productSelect.val(sale.product).trigger('change');
+        if (sale.product) {
+            row.dataset.initializingSaleRow = 'true';
+            productSelect.val(sale.product).trigger('change');
+            delete row.dataset.initializingSaleRow;
+        }
         if (sale.price !== undefined && sale.price !== '') row.querySelector('.sale-price').value = Number(sale.price || 0).toFixed(2);
         if (sale.quantity !== undefined && sale.quantity !== '') row.querySelector('.sale-quantity').value = sale.quantity;
         updateSaleTotals();
+        return row;
     };
 
     const createExpenseRow = (expense = {}) => {
-        const expenseProducts = getTastingProducts();
+        let expenseProducts = getTastingProducts();
+        // نفس المبدأ: مادة محفوظة لم تعد ضمن القائمة تبقى محفوظة بدل أن تضيع.
+        if (expense.item && !expenseProducts.some(p => p.name === expense.item)) {
+            expenseProducts = expenseProducts.concat([{ name: expense.item, barcode: '', category: '' }]);
+        }
         const existingExpenses = Array.from(expensesTableBody.querySelectorAll('.expense-item')).map(select => $(select).val());
         if (expense.item && existingExpenses.includes(expense.item) && !expense.quantity) return;
 
@@ -678,6 +1401,9 @@ async function handleReportPage() {
      * [إضافة جديدة] دالة لإعادة تعيين النموذج بالكامل بدون إعادة تحميل الصفحة
      */
     const resetFullForm = () => {
+        const wasRestoring = stateRestoring;
+        stateRestoring = true;
+        try {
         // إعادة تعيين الحقول الأساسية
         document.getElementById('eventDays').value = '1';
         document.getElementById('date').value = '';
@@ -690,9 +1416,8 @@ async function handleReportPage() {
         $('#governorate, #campaign, #event, #inventoryDependency, #coordinator, #promoter1, #promoter2, #promoter3, #promoter4').val(null).trigger('change');
         // تفريغ الأشخاص المتواجدين ضمن النقطة بالكامل
         setSelectedPromoters([]);
-        const promotersSelectionTbodyReset = document.getElementById('promotersSelectionTbody');
-        if (promotersSelectionTbodyReset) {
-            promotersSelectionTbodyReset.querySelectorAll('.promoter-checkbox').forEach(cb => {
+        if (promotersSelectionTbody) {
+            promotersSelectionTbody.querySelectorAll('.promoter-checkbox').forEach(cb => {
                 cb.checked = false;
             });
         }
@@ -703,9 +1428,20 @@ async function handleReportPage() {
         salesTableBody.innerHTML = '';
         expensesTableBody.innerHTML = '';
         updateSaleTotals();
+        refreshRestoreBtn();
 
         // إزالة علامات التحقق من الصحة
         reportForm.classList.remove('was-validated');
+
+        // تفريغ حقل موقع المحل (GPS)
+        applyGpsToFields(null, null);
+        const gpsStatus = document.getElementById('gpsStatus');
+        if (gpsStatus) gpsStatus.textContent = '';
+        } finally {
+            stateRestoring = wasRestoring;
+            isFormDirty = false;
+            clearFormDraft();
+        }
     };
 
     const validateRequiredPrices = () => {
@@ -724,23 +1460,113 @@ async function handleReportPage() {
         return firstInvalid;
     };
 
-    const handleFormSubmit = (event, editId, addAnother = false) => {
+    // V61: تتبّع الموقع (GPS) — اختياري وسريع، لا يعطّل إرسال التقرير عند طلب الإذن أو فشل الإشارة.
+    // يفضّل الإحداثيات الظاهرة في الحقول؛ إن كانت فارغة يحاول التقاطاً سريعاً ويعبّئها.
+    const tryCaptureGps = async (reportData) => {
+        const lat = document.getElementById('latitude')?.value?.trim();
+        const lng = document.getElementById('longitude')?.value?.trim();
+        if (lat && lng && !isNaN(Number(lat)) && !isNaN(Number(lng))) {
+            reportData.latitude = Number(lat);
+            reportData.longitude = Number(lng);
+            return;
+        }
+        if (!('geolocation' in navigator)) return;
+        const pos = await captureGps();
+        if (pos) {
+            applyGpsToFields(pos.latitude, pos.longitude);
+            reportData.latitude = pos.latitude;
+            reportData.longitude = pos.longitude;
+        }
+    };
+
+    // V61: كشف تكرار محتمل قبل الإرسال — نفس المحل + نفس التاريخ (+ نفس الحملة والموظف)
+    // من الكاش الفوري أولاً، ثم من الخادم إن لزم — يعمل أوفلاين عبر الكاش المحفوظ.
+    const findDuplicateReports = async (candidate) => {
+        const market = String(candidate.market || '').trim();
+        const date = String(candidate.date || '').slice(0, 10);
+        if (!market || !date || !/^\d{4}-\d{2}-\d{2}$/.test(date)) return null;
+        const owner = String(candidate.createdById || '');
+        let reports = Array.isArray(memoryReportsCache) ? memoryReportsCache : null;
+        if (!reports && !Array.isArray(reports) && navigator.onLine && typeof cachedReportsFetch === 'function') {
+            try {
+                reports = await cachedReportsFetch({
+                    userId: candidate.createdById || '',
+                    role: String(candidate.role || localStorage.getItem('currentUser') && (JSON.parse(localStorage.getItem('currentUser')).role || '')),
+                    userName: candidate.createdByName || ''
+                }, { ttlMinutes: 1 });
+            } catch (e) { reports = null; }
+        }
+        if (!Array.isArray(reports)) {
+            try {
+                const raw = localStorage.getItem('reportsCache');
+                if (raw && raw !== 'undefined') reports = JSON.parse(raw);
+            } catch (e) { reports = null; }
+        }
+        if (!Array.isArray(reports) || !reports.length) return null;
+        const matches = reports.filter(r => {
+            if (String(r.market || '').trim() !== market) return false;
+            if (String(r.date || '').slice(0, 10) !== date) return false;
+            if (candidate.campaign && String(r.campaign || '').trim() && String(r.campaign).trim() !== String(candidate.campaign).trim()) return false;
+            if (owner && r.createdById && String(r.createdById) !== owner) return false;
+            return true;
+        });
+        if (!matches.length) return null;
+        const shown = matches.slice(0, 3).map(m =>
+            `• ${m.createdByName || 'موظف'} — ${m.createdAt || 'تاريخ غير معروف'}`).join('\n');
+        const extra = matches.length > 3 ? `\n... و${matches.length - 3} تقارير أخرى` : '';
+        return `تم العثور على ${matches.length} تقرير مكرر محتمل بنفس المحل (${market}) والتاريخ (${date}):\n${shown}${extra}\n\nهل تريد الحفظ على أي حال؟`;
+    };
+
+    const handleFormSubmit = async (event, editId, addAnother = false) => {
         if(event) event.preventDefault();
         const firstInvalidPrice = validateRequiredPrices();
         if (firstInvalidPrice) firstInvalidPrice.focus();
-        if (!reportForm.checkValidity()) { 
-            if(event) event.stopPropagation(); 
-            reportForm.classList.add('was-validated'); 
-            return; 
+        if (!reportForm.checkValidity()) {
+            if(event) event.stopPropagation();
+            reportForm.classList.add('was-validated');
+            return;
+        }
+        // «الأ‍♂️ المتواجدين ضمن النقطة» مطلوب. The four inputs holding the value
+        // are type=hidden, which the HTML spec bars from constraint validation,
+        // so checkValidity() above cannot catch this one.
+        if (!validatePromotersPresence()) {
+            if(event) event.stopPropagation();
+            reportForm.classList.add('was-validated');
+            document.getElementById('openPromotersBtn')?.focus();
+            return;
         }
 
-        const reportData = getFormState();
+        const submittedDraft = getFormState();
+        const submittedDraftSnapshot = JSON.stringify(submittedDraft);
+        const reportData = { ...submittedDraft };
         isFormDirty = false;
-        localStorage.removeItem(FORM_STATE_KEY); 
+        
+        reportData.id = editId || Date.now();
+        reportData.createdAt = editId ? originalCreatedAt : new Date().toLocaleString('ar-EG');
+        reportData.promoters = [reportData.promoter1, reportData.promoter2, reportData.promoter3, reportData.promoter4].filter(p => p && p !== 'غير محدد');
+        reportData.supervisor = supervisorInput.value;
+        reportData.participants = [...new Set([reportData.coordinator, reportData.inventoryDependency, reportData.supervisor, ...reportData.promoters].filter(Boolean))];
+
+        // V61: أثر التعديل — يُرسل مع التقرير ويخزّنه الخادم في عمودي editedAt/editedBy.
+        if (editId) {
+            reportData.editedAt = new Date().toISOString();
+            reportData.editedBy = reportData.createdByName || reportData.createdById || '';
+        }
+
+        // V61: التقاط الموقع إن أمكن (اختياري، دون إمساك المستخدم أو الإرسال).
+        await tryCaptureGps(reportData);
+
+        // V61: تنبيه التكرار المحتمل قبل فتح نافذة الحفظ.
+        if (!editId) {
+            const dupMsg = await findDuplicateReports(reportData);
+            if (dupMsg && !confirm(dupMsg)) {
+                isFormDirty = true;
+                saveFormState();
+                return;
+            }
+        }
         
         if (addAnother) {
-            // [تصحيح] استدعاء دالة إعادة التعيين الكاملة
-            resetFullForm(); 
             showToast('التقرير قيد الحفظ في الخلفية...');
         } else {
             document.querySelector('#successModal .fs-5').textContent = 'التقرير قيد الحفظ في الخلفية...';
@@ -748,33 +1574,51 @@ async function handleReportPage() {
             viewReportBtn.classList.add('disabled');
             successModal.show();
         }
-
-        reportData.id = editId || Date.now();
-        reportData.createdAt = editId ? originalCreatedAt : new Date().toLocaleString('ar-EG');
-        reportData.promoters = [reportData.promoter1, reportData.promoter2, reportData.promoter3, reportData.promoter4].filter(p => p && p !== 'غير محدد');
-        reportData.supervisor = supervisorInput.value;
-        reportData.participants = [...new Set([reportData.coordinator, reportData.inventoryDependency, reportData.supervisor, ...reportData.promoters].filter(Boolean))];
         
         const saveOnlineOrQueue = async () => {
+            // حدّث الكاش الشخصي فوراً كي يستخدم التقرير التالي السعر الذي اختاره
+            // المستخدم حتى لو أُرسل هذا التقرير إلى قائمة الانتظار دون اتصال.
+            rememberUserProductPricesFromReport(reportData);
+            await flushPendingUserPriceSaves();
+            // اكتب التقرير كاملاً في IndexedDB قبل أي طلب شبكة أو تفريغ للنموذج,
+            // كي لا يضيع إذا أُغلق التطبيق قبل تأكيد الخادم.
+            let pendingLocalId = '';
+            try {
+                pendingLocalId = await queueReportOffline(reportData, { registerSync: false });
+                try {
+                    if (localStorage.getItem(formStateKey()) === submittedDraftSnapshot) clearFormDraft();
+                } catch (e) { /* يبقى التقرير كاملاً في IndexedDB */ }
+                if (addAnother) resetFullForm();
+            } catch (storageError) {
+                // لا نمنع الإرسال المتصل في متصفح لا يدعم IndexedDB؛ تبقى
+                // المسودة المحلية حتى ينجح الإرسال. دون اتصال لا نمسحها أبداً.
+                if (!navigator.onLine) throw storageError;
+                console.warn('تعذر إنشاء نسخة انتظار محلية قبل الإرسال:', storageError);
+            }
+
             if (!navigator.onLine) {
-                await queueReportOffline(reportData);
-                return { queued: true };
+                if (!pendingLocalId) throw new Error('تعذر حفظ التقرير محلياً؛ لم تُحذف المسودة. أعد المحاولة عند توفر التخزين.');
+                registerBackgroundSync();
+                return { queued: true, localId: pendingLocalId };
             }
             try {
-                const res = await fetch(SCRIPT_URL, {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'text/plain;charset=utf-8' },
-                    body: JSON.stringify({ action: 'submitReport', payload: reportData })
-                });
-                const result = await res.json();
-                if (result.status !== 'success') throw new Error(result.message || 'فشل الحفظ');
+                const result = await apiPost('submitReport', reportData);
+                if (!result || result.status !== 'success') throw new Error(result?.message || 'فشل الحفظ');
+                if (pendingLocalId) {
+                    try { await removePendingReport(pendingLocalId); }
+                    catch (cleanupError) { console.warn('Report sent; pending copy cleanup will retry:', cleanupError); }
+                } else {
+                    try {
+                        if (localStorage.getItem(formStateKey()) === submittedDraftSnapshot) clearFormDraft();
+                    } catch (e) {}
+                    if (addAnother) resetFullForm();
+                }
                 // Do NOT rebuild the whole master-data cache after every report.
                 // Reports do not change Products/Locations/Employees, so a full refresh here
                 // only adds a large network round-trip and JSON parsing cost. The server
                 // invalidates the report cache on save; history will fetch the fresh report list
                 // when opened. Keep the current in-memory product cache intact.
-                memoryReportsCache = null;
-                localStorage.removeItem('reportsCache');
+                invalidateReportsCache();
                 window.dispatchEvent(new CustomEvent('reportsCacheInvalidated'));
                 return result;
             } catch (error) {
@@ -782,16 +1626,20 @@ async function handleReportPage() {
                 const networkFailure = !navigator.onLine || error instanceof TypeError ||
                     /failed to fetch|network|load failed/i.test(String(error.message || ''));
                 if (networkFailure) {
-                    await queueReportOffline(reportData);
-                    return { queued: true };
+                    if (pendingLocalId) {
+                        registerBackgroundSync();
+                        return { queued: true, localId: pendingLocalId };
+                    }
                 }
+                // حتى أخطاء الخادم لا تحذف النسخة المحلية؛ تبقى ظاهرة في قائمة المزامنة.
                 throw error;
             }
         };
 
         saveOnlineOrQueue()
             .then(result => {
-                localStorage.removeItem('reportsCache');
+                resetAfterSubmitSuccess = true;
+                saveLastPoint(reportData);
                 if (result.queued) {
                     updateOfflineStatus();
                     if (addAnother) {
@@ -805,6 +1653,8 @@ async function handleReportPage() {
                     return;
                 }
 
+                spawnConfetti();
+
                 if (addAnother) {
                     // resetFullForm() تم استدعاؤها مسبقاً، وتشمل تفريغ الأشخاص المتواجدين.
                     showToast('تم حفظ التقرير السابق بنجاح.');
@@ -813,20 +1663,21 @@ async function handleReportPage() {
                     // لا نفرّغ نموذج التعديل حتى يبقى التقرير المعروض كما هو.
                     if (!editId) {
                         setSelectedPromoters([]);
-                        const promotersSelectionTbodyAfterSubmit = document.getElementById('promotersSelectionTbody');
-                        if (promotersSelectionTbodyAfterSubmit) {
-                            promotersSelectionTbodyAfterSubmit.querySelectorAll('.promoter-checkbox').forEach(cb => {
+                        if (promotersSelectionTbody) {
+                            promotersSelectionTbody.querySelectorAll('.promoter-checkbox').forEach(cb => {
                                 cb.checked = false;
                             });
-                    }
+                        }
                     }
                     document.querySelector('#successModal .fs-5').textContent = 'تم حفظ التقرير بنجاح!';
                     document.getElementById('success-spinner').style.display = 'none';
-                    viewReportBtn.href = `history.html#c-${result.reportId}`;
+                    viewReportBtn.href = '#/history';
+                    sessionStorage.setItem('spaScrollReportId', String(result.reportId));
                     viewReportBtn.classList.remove('disabled');
                 }
             })
             .catch(error => {
+                resetAfterSubmitSuccess = false;
                 isFormDirty = true;
                 saveFormState();
                 if (addAnother) {
@@ -869,8 +1720,11 @@ async function handleReportPage() {
     };
 
     const createCompetitorSaleRow = (sale = {}) => {
-        const products = getCompetitorProducts();
-        if (sale.product && !products.some(p => p.name === sale.product)) return;
+        let products = getCompetitorProducts();
+        if (sale.product && !products.some(p => p.name === sale.product)) {
+            // Preserve historical rows even if the master list changed or is not cached offline.
+            products = products.concat([{ name: sale.product, barcode: '' }]);
+        }
         const row = document.createElement('tr');
         const productOptions = products.map(p => {
             const safeName = escapeHtml(String(p.name ?? ''));
@@ -895,13 +1749,12 @@ async function handleReportPage() {
         // fetch them directly from ProductsOfCompetitor.
         if (!products.length && navigator.onLine) {
             try {
-                const res = await fetch(`${SCRIPT_URL}?action=getCompetitorProducts&v=${APP_DB_VERSION}&t=${Date.now()}`, {cache:'no-store'});
-                const freshProducts = await res.json();
+                const freshProducts = await apiGet('getCompetitorProducts', { v: APP_DB_VERSION });
                 if (Array.isArray(freshProducts)) {
                     DB.competitorProducts = freshProducts;
                     products = getCompetitorProducts();
-                    localStorage.setItem(APP_DB_KEY, JSON.stringify(DB));
-                    localStorage.setItem(APP_DB_TS_KEY, String(Date.now()));
+                    localStorage.setItem(appDbCacheKey(), JSON.stringify(DB));
+                    localStorage.setItem(appDbCacheTsKey(), String(Date.now()));
                 }
             } catch (e) {
                 console.warn('تعذر جلب مواد المنافس مباشرة:', e);
@@ -946,20 +1799,28 @@ async function handleReportPage() {
         });
     }
     
+    // لا تُترك النافذة فارغة بلا تفسير — كان الخطأ يظهر كقائمة اختيارات فارغة.
+    const renderProductPicker = (tbody, products, buildRow, emptyMessage) => {
+        tbody.innerHTML = '';
+        if (!products.length) {
+            tbody.innerHTML = `<tr><td colspan="2" class="text-center text-muted py-4">${emptyMessage}</td></tr>`;
+            return;
+        }
+        products.forEach(product => tbody.insertAdjacentHTML('beforeend', buildRow(product)));
+    };
+
     function populateProductSelectionModal(campaignName) {
         const products = getSaleProducts();
-        productSelectionTbody.innerHTML = '';
-        products.forEach(product => { productSelectionTbody.insertAdjacentHTML('beforeend', `<tr><td><div class="form-check"><input class="form-check-input product-select-check" type="checkbox" value="${product.name}" data-price="${getSaleDisplayPrice(product)}" style="pointer-events: none;"></div></td><td>${product.name}</td></tr>`); });
+        renderProductPicker(productSelectionTbody, products, product => `<tr><td><div class="form-check"><input class="form-check-input product-select-check" type="checkbox" value="${product.name}" data-price="${getSaleDisplayPrice(product)}" style="pointer-events: none;"></div></td><td>${product.name}</td></tr>`, 'لا توجد مواد في ورقة Products. تأكد من إدخال اسم المادة.');
         productSearchInput.value = ''; productSearchInput.dispatchEvent(new Event('input'));
     }
     addSaleRowBtn.addEventListener('click', () => { const c = campaignSelect.value; if (!c) { alert('يرجى اختيار نوع الحملة أولاً.'); return; } populateProductSelectionModal(c); productModal.show(); });
     productSearchInput.addEventListener('input', () => { const s = productSearchInput.value.toLowerCase().trim(); productSelectionTbody.querySelectorAll('tr').forEach(r => { r.style.display = r.cells[1].textContent.toLowerCase().includes(s) ? '' : 'none'; }); });
-    addSelectedProductsBtn.addEventListener('click', () => { productSelectionTbody.querySelectorAll('.product-select-check:checked').forEach(c => createSaleRow({ product: c.value, price: c.dataset.price })); updateSaleTotals(); productModal.hide(); isFormDirty = true; saveFormState(); });
+    addSelectedProductsBtn.addEventListener('click', () => { productSelectionTbody.querySelectorAll('.product-select-check:checked').forEach(c => createSaleRow({ product: c.value, price: c.dataset.price, _refreshPriceOnLoad: true })); updateSaleTotals(); productModal.hide(); isFormDirty = true; saveFormState(); });
     
     function populateExpenseSelectionModal(campaignName) {
         const products = getTastingProducts();
-        expenseSelectionTbody.innerHTML = '';
-        products.forEach(product => { expenseSelectionTbody.insertAdjacentHTML('beforeend', `<tr><td><div class="form-check"><input class="form-check-input expense-select-check" type="checkbox" value="${product.name}" style="pointer-events: none;"></div></td><td>${product.name}</td></tr>`); });
+        renderProductPicker(expenseSelectionTbody, products, product => `<tr><td><div class="form-check"><input class="form-check-input expense-select-check" type="checkbox" value="${product.name}" style="pointer-events: none;"></div></td><td>${product.name}</td></tr>`, 'لا توجد مواد تذوق في ورقة Products. تأكد من إدخال اسم المادة.');
         expenseSearchInput.value = ''; expenseSearchInput.dispatchEvent(new Event('input'));
     }
     addExpenseRowBtn.addEventListener('click', () => { const c = campaignSelect.value; if (!c) { alert('يرجى اختيار نوع الحملة أولاً.'); return; } populateExpenseSelectionModal(c); expenseModal.show(); });
@@ -1002,6 +1863,7 @@ async function handleReportPage() {
         document.getElementById('timeTo').value = toTimeInputValue(report.timeTo);
         document.getElementById('notes').value = report.notes;
         if (document.getElementById('phoneNumber')) document.getElementById('phoneNumber').value = report.phoneNumber || '';
+        applyGpsToFields(report.latitude, report.longitude);
         supervisorInput.value = report.supervisor || '';
         populateEmployees(report);
         originalCreatedAt = report.createdAt;
@@ -1043,8 +1905,9 @@ async function handleReportPage() {
        // updatePhoneNumberRequirement();
         updateSalesVisibility();
         updateCompetitorSalesVisibility();
-        // أسعار المبيعات تعتمد على Products فقط في ترويج وبيع مباشر؛ وفي باقي الأحداث يجب على المستخدم إدخال السعر.
-        salesTableBody.querySelectorAll('tr').forEach(row => { const sel=row.querySelector('.sale-product'); const name=String($(sel).val()||'').trim(); const master=getSaleProducts().find(p=>p.name===name); if(sel && master) row.querySelector('.sale-price').value = isDirectSaleEvent() ? Number(master.price||0).toFixed(2) : ''; });
+        // عند تغيير نوع الحدث نعيد تحميل السعر الشخصي للمستخدم (أو السعر الأساسي لأول مرة)،
+        // وتبقى الحقول قابلة للتعديل دون كتابة أي سعر إلى Products المشتركة.
+        salesTableBody.querySelectorAll('tr').forEach(row => { const sel=row.querySelector('.sale-product'); const name=String($(sel).val()||'').trim(); const master=getSaleProducts().find(p=>p.name===name); if(sel && master) { row.querySelector('.sale-price').value = Number(getSaleDisplayPrice(master)||0).toFixed(2); row.dataset.priceManuallyEdited = 'false'; } });
         document.querySelectorAll('.sale-price, .competitor-price').forEach(input => input.setCustomValidity(''));
         updateSaleTotals();
         const isDirectPromotion = $(this).val() === 'ترويج مباشر';
@@ -1061,23 +1924,29 @@ async function handleReportPage() {
     //updatePhoneNumberRequirement();
     updateSalesVisibility();
 
-    const urlParams = new URLSearchParams(window.location.search);
-    const editId = urlParams.get('edit');
+    // V58: في الـ SPA يُقرأ معرّف التعديل من تجزئة الرابط (#/reports?edit=) أو من
+    // مؤشر التنقل بين الشاشات (window.__spaPendingEditId) — لم يعد هناك ?edit= في مسار الصفحة.
+    const urlParams = (typeof queryFromHash === 'function') ? queryFromHash() : new URLSearchParams(window.location.search);
+    let editId = urlParams.get('edit') || window.__spaPendingEditId || '';
+    window.__spaPendingEditId = null;
 
-    if (editId) {
-        localStorage.removeItem(FORM_STATE_KEY);
-        const reportFromState = JSON.parse(sessionStorage.getItem(EDIT_STATE_KEY));
+    // الدخول في وضع التعديل — تستخدم عند أول فتح للشاشة وعند إعادة زيارتها من السجل.
+    const enterEditMode = (id) => {
+        editId = id;
+        clearFormDraft();
+        const reportFromState = JSON.parse(sessionStorage.getItem(reportToEditKey()));
         // الحالة المحلية تعرض التقرير فوراً، ثم الخادم يعيد أحدث نسخة دائماً.
-        if (reportFromState && reportFromState.id == editId) {
+        if (reportFromState && reportFromState.id == id) {
             initEditMode(reportFromState);
-            sessionStorage.removeItem(EDIT_STATE_KEY);
+            sessionStorage.removeItem(reportToEditKey());
         }
         mainSubmitBtn.disabled = true;
+        document.getElementById('edit-loading')?.remove();
         mainContainer.insertAdjacentHTML('afterbegin', `<div class="alert alert-info text-center p-3" id="edit-loading"><i class="fa-solid fa-spinner fa-spin"></i> مزامنة أحدث بيانات التقرير...</div>`);
         (async () => {
             try {
-                const res = await fetch(`${SCRIPT_URL}?action=getReportById&id=${encodeURIComponent(editId)}&_refresh=${Date.now()}`, {cache:'no-store'});
-                const result = await res.json();
+                const res = await apiGet('getReportById', { id: id });
+                const result = await res;
                 document.getElementById('edit-loading')?.remove();
                 if (result.status === 'success') {
                     initEditMode(result.report);
@@ -1086,12 +1955,29 @@ async function handleReportPage() {
             } catch (error) {
                 document.getElementById('edit-loading')?.remove();
                 mainSubmitBtn.disabled = false;
-                if (!reportFromState || reportFromState.id != editId) alert(`خطأ في تحميل بيانات التعديل: ${error.message}`);
+                if (!reportFromState || reportFromState.id != id) alert(`خطأ في تحميل بيانات التعديل: ${error.message}`);
             }
         })();
+    };
+
+    isFormInitializing = false;
+    isFormDirty = false; // Ignore synthetic initialization changes; only a real draft/user edit is dirty.
+    if (editId) {
+        enterEditMode(editId);
     } else {
         loadFormState();
     }
+
+    // V58: إعادة دخول وضع التعديل عند الضغط على «تعديل» من السجل والشاشة مبنية أصلاً —
+    // لأنه عند إعادة الزيارة لا يُعاد تشغيل handleReportPage بالكامل.
+    window.addEventListener('spaViewRevisited', (event) => {
+        if (event.detail && event.detail.route !== 'reports') return;
+        if (window.__spaPendingEditId) {
+            const pending = String(window.__spaPendingEditId);
+            window.__spaPendingEditId = null;
+            enterEditMode(pending);
+        }
+    });
     
 
     // ===============================================================
@@ -1409,10 +2295,29 @@ async function handleReportPage() {
     submitAndAddAnotherBtn.addEventListener('click', (event) => handleFormSubmit(event, editId, true));
     
     document.getElementById('successModal').addEventListener('hidden.bs.modal', () => {
-        if (!editId) { // فقط إذا كان تقريرًا جديدًا
-            resetFullForm();
-        } else {
-            window.location.href = 'reports.html'; // في حالة التعديل، ارجع إلى صفحة فارغة
+        if (!resetAfterSubmitSuccess) {
+            // فشل الإرسال: لا تفرّغ البيانات، بل أبقها محفوظة كمسودة ليستطيع المستخدم المحاولة مجدداً.
+            isFormDirty = true;
+            saveFormState();
+            return;
+        }
+        resetAfterSubmitSuccess = false;
+        if (editId) {
+            // الخروج من وضع التعديل لتصبح الشاشة جاهزة لتقرير جديد — دون إعادة تحميل الصفحة.
+            editId = '';
+            sessionStorage.removeItem(reportToEditKey());
+        }
+        resetFullForm();
+    });
+
+    // اختصار لوحة المفاتيح: Ctrl+S / Cmd+S لإرسال التقرير.
+    document.addEventListener('keydown', (event) => {
+        if ((event.ctrlKey || event.metaKey) && String(event.key).toLowerCase() === 's') {
+            event.preventDefault();
+            if (confirm('إرسال التقرير الآن؟')) reportForm.requestSubmit();
         }
     });
 }
+
+// V58: تسجيل شاشة التقارير في موجه الـ SPA.
+if (typeof registerView === 'function') registerView('reports', handleReportPage);
